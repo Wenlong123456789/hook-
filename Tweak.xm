@@ -245,8 +245,7 @@ static BOOL ShouldBlockSockaddr(const struct sockaddr *addr, NBProto proto) {
     return %orig;
 }
 
-%hookf(ssize_t, sendto, int socketFD, const void *buffer, size_t length, int flags,
-       const struct sockaddr *dest_addr, socklen_t dest_len) {
+%hookf(ssize_t, sendto, int socketFD, const void *buffer, size_t length, int flags, const struct sockaddr *dest_addr, socklen_t dest_len) {
     if (dest_addr && ShouldBlockSockaddr(dest_addr, NBProtoUDP)) {
         errno = ECONNREFUSED;
         return -1;
@@ -254,8 +253,7 @@ static BOOL ShouldBlockSockaddr(const struct sockaddr *addr, NBProto proto) {
     return %orig;
 }
 
-%hookf(int, getaddrinfo, const char *hostname, const char *servname,
-       const struct addrinfo *hints, struct addrinfo **res) {
+%hookf(int, getaddrinfo, const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res) {
     int ret = %orig;
     if (ret == 0 && hostname && res && *res) {
         NSString *host = [NSString stringWithUTF8String:hostname];
@@ -273,8 +271,7 @@ static BOOL ShouldBlockSockaddr(const struct sockaddr *addr, NBProto proto) {
 
 // 老式/部分三方库会直接用域名建流,例如:
 // CFStreamCreatePairWithSocketToHost(kCFAllocatorDefault, (CFStringRef)host, port, &readStream, &writeStream);
-%hookf(void, CFStreamCreatePairWithSocketToHost, CFAllocatorRef alloc, CFStringRef host, UInt32 port,
-       CFReadStreamRef *readStream, CFWriteStreamRef *writeStream) {
+%hookf(void, CFStreamCreatePairWithSocketToHost, CFAllocatorRef alloc, CFStringRef host, UInt32 port, CFReadStreamRef *readStream, CFWriteStreamRef *writeStream) {
     NSString *hostStr = (__bridge NSString *)host;
     BOOL blocked = [[NBRuleEngine shared] shouldBlockHost:hostStr port:(int)port proto:NBProtoTCP];
     [[NBRuleEngine shared] logEvent:
@@ -290,8 +287,7 @@ static BOOL ShouldBlockSockaddr(const struct sockaddr *addr, NBProto proto) {
 }
 
 // CFSocketStream 的另一常见入口: CFStreamCreatePairWithSocketToCFHost(alloc, CFHostRef, port, ...)
-%hookf(void, CFStreamCreatePairWithSocketToCFHost, CFAllocatorRef alloc, CFHostRef host, UInt32 port,
-       CFReadStreamRef *readStream, CFWriteStreamRef *writeStream) {
+%hookf(void, CFStreamCreatePairWithSocketToCFHost, CFAllocatorRef alloc, CFHostRef host, UInt32 port, CFReadStreamRef *readStream, CFWriteStreamRef *writeStream) {
     NSString *hostStr = nil;
     if (host) {
         Boolean resolved = false;
