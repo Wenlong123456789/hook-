@@ -1,0 +1,12 @@
+{
+    Filter = {
+        Bundles = (
+            "com.example.targetapp"
+        );
+        /* 也可以用 Executables 限定进程名,二选一或同时使用:
+        Executables = (
+            "TargetAppExecutable"
+        );
+        */
+    };
+}

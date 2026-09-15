@@ -1,0 +1,15 @@
+{
+  "log": true,
+  "default_action": "allow",
+  "rules": [
+    { "host": "www.163.com",             "port": 0,   "proto": "any", "action": "block" },
+    { "host": "ios.perfsight.qq.com",    "port": 0,   "proto": "any", "action": "block" },
+    { "host": "ir-sdk.dun.163.com",      "port": 0,   "proto": "any", "action": "block" },
+
+    { "host": "*.doubleclick.net", "port": 0,   "proto": "any", "action": "block" },
+    { "host": "api.example.com",   "port": 443, "proto": "tcp", "action": "block" },
+    { "host": "push.example.com",  "port": 0,   "proto": "udp", "action": "block" },
+    { "host": "test.internal.local","port": 8080,"proto": "tcp","action": "allow" },
+    { "host": "*",                 "port": 53,  "proto": "udp", "action": "allow" }
+  ]
+}

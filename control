@@ -1,0 +1,9 @@
+Package: com.yourteam.netblocktweak
+Name: NetBlockTweak
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 用于测试环境的应用内网络流量(HTTP/HTTPS/TCP/UDP)阻断与拦截工具,注入指定测试App使用
+Maintainer: Your Name <you@example.com>
+Author: Your Name <you@example.com>
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0)
