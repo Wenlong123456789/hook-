@@ -319,7 +319,7 @@ static BOOL ShouldBlockSockaddr(const struct sockaddr *addr, NBProto proto) {
         CFArrayRef addrs = CFHostGetAddressing(theHost, &addrResolved);
         if (hostStr && addrs) {
             for (CFIndex i = 0; i < CFArrayGetCount(addrs); i++) {
-                CFDataRef addrData = CFArrayGetValueAtIndex(addrs, i);
+                CFDataRef addrData = (CFDataRef)CFArrayGetValueAtIndex(addrs, i);
                 const struct sockaddr *sa = (const struct sockaddr *)CFDataGetBytePtr(addrData);
                 NSString *ip = IPStringFromSockaddr(sa);
                 if (ip) {
