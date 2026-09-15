@@ -1,6 +1,13 @@
 // NetBlockTweak
 // 用途: 注入测试 App,按可配置规则拦截/放行 App 内的 HTTP/HTTPS/TCP/UDP 流量
 // 仅供在你拥有权限的测试设备、测试 App 上做网络异常/弱网/防护逻辑测试使用
+//
+// 修复说明 (2026-09-14):
+// 1. LogFilePath 支持 rootless / rootful 双路径，避免权限问题导致异常
+// 2. 热加载 timer 用成员变量强引用，防止 ARC 释放后定时器失效
+// 3. logEvent 对 fileHandle 做空判断，防止写日志崩溃
+// 4. %ctor 更稳健：先 %init，再延迟初始化规则引擎，减少启动瞬间崩溃概率
+// 5. 增加更多空指针与异常保护
 
 #import <Foundation/Foundation.h>
 #import <CFNetwork/CFNetwork.h>
@@ -46,7 +53,18 @@ static NSString *RulesFilePath(void) {
 }
 
 static NSString *LogFilePath(void) {
-    return @"/var/mobile/Library/Logs/NetBlockTweak.log";
+    // 与规则文件保持一致，优先 rootless
+    NSArray<NSString *> *candidates = @[
+        @"/var/jb/var/mobile/Library/Logs/NetBlockTweak.log",
+        @"/var/mobile/Library/Logs/NetBlockTweak.log",
+    ];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    // 优先返回已存在的目录所在路径；若不存在则返回第一个（后续 create 时再处理）
+    for (NSString *p in candidates) {
+        NSString *dir = [p stringByDeletingLastPathComponent];
+        if ([fm fileExistsAtPath:dir]) return p;
+    }
+    return candidates.firstObject;
 }
 
 @interface NBRuleEngine : NSObject
@@ -64,6 +82,7 @@ static NSString *LogFilePath(void) {
     BOOL _logEnabled;
     NSMutableDictionary<NSString *, NSString *> *_ipToHost;
     dispatch_queue_t _queue;
+    dispatch_source_t _watchTimer;   // 强引用，防止被 ARC 释放
 }
 
 + (instancetype)shared {
@@ -74,54 +93,81 @@ static NSString *LogFilePath(void) {
         instance->_queue = dispatch_queue_create("com.yourteam.netblocktweak.rules", DISPATCH_QUEUE_SERIAL);
         instance->_ipToHost = [NSMutableDictionary dictionary];
         instance->_rules = @[];
-        [instance reload];
-        [instance startWatchingForChanges];
+        instance->_logEnabled = YES; // 默认开日志，reload 后会覆盖
+        // 延迟到第一次真正需要时再 reload + 启动 timer，减少 %ctor 瞬间崩溃概率
+        // 这里仍立即初始化，但全部包在 try 逻辑里
+        @try {
+            [instance reload];
+            [instance startWatchingForChanges];
+        } @catch (NSException *e) {
+            NSLog(@"[NetBlockTweak] NBRuleEngine init exception: %@", e);
+        }
     });
     return instance;
 }
 
 - (void)startWatchingForChanges {
-    // 简单轮询热加载规则文件,便于测试时不重启 App 就能改规则
-    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
-    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), 3 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
-    dispatch_source_set_event_handler(timer, ^{
-        [self reload];
+    if (_watchTimer) return; // 已启动
+
+    _watchTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
+    if (!_watchTimer) return;
+
+    dispatch_source_set_timer(_watchTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                              3 * NSEC_PER_SEC,
+                              1 * NSEC_PER_SEC);
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(_watchTimer, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) {
+            [strongSelf reload];
+        }
     });
-    dispatch_resume(timer);
+    dispatch_resume(_watchTimer);
 }
 
 - (void)reload {
     dispatch_sync(_queue, ^{
-        NSData *data = [NSData dataWithContentsOfFile:RulesFilePath()];
-        NSMutableArray<NBRule *> *arr = [NSMutableArray array];
-        BOOL defaultBlock = NO;
-        BOOL logEnabled = YES;
-        if (data) {
-            NSError *err = nil;
-            id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
-            if ([json isKindOfClass:[NSDictionary class]]) {
-                NSDictionary *dict = (NSDictionary *)json;
-                logEnabled = dict[@"log"] ? [dict[@"log"] boolValue] : YES;
-                NSString *defAction = [dict[@"default_action"] lowercaseString];
-                defaultBlock = [defAction isEqualToString:@"block"];
-                for (NSDictionary *d in dict[@"rules"]) {
-                    if (![d isKindOfClass:[NSDictionary class]]) continue;
-                    NBRule *r = [NBRule new];
-                    r.host = d[@"host"] ?: @"*";
-                    r.port = [d[@"port"] intValue];
-                    NSString *p = [d[@"proto"] lowercaseString];
-                    if ([p isEqualToString:@"tcp"]) r.proto = NBProtoTCP;
-                    else if ([p isEqualToString:@"udp"]) r.proto = NBProtoUDP;
-                    else r.proto = NBProtoAny;
-                    NSString *action = [d[@"action"] lowercaseString];
-                    r.block = action ? [action isEqualToString:@"block"] : YES;
-                    [arr addObject:r];
+        @try {
+            NSData *data = [NSData dataWithContentsOfFile:RulesFilePath()];
+            NSMutableArray<NBRule *> *arr = [NSMutableArray array];
+            BOOL defaultBlock = NO;
+            BOOL logEnabled = YES;
+            if (data) {
+                NSError *err = nil;
+                id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+                if ([json isKindOfClass:[NSDictionary class]]) {
+                    NSDictionary *dict = (NSDictionary *)json;
+                    if (dict[@"log"]) {
+                        logEnabled = [dict[@"log"] boolValue];
+                    }
+                    NSString *defAction = [[dict[@"default_action"] description] lowercaseString];
+                    defaultBlock = [defAction isEqualToString:@"block"];
+                    id rulesObj = dict[@"rules"];
+                    if ([rulesObj isKindOfClass:[NSArray class]]) {
+                        for (id item in (NSArray *)rulesObj) {
+                            if (![item isKindOfClass:[NSDictionary class]]) continue;
+                            NSDictionary *d = (NSDictionary *)item;
+                            NBRule *r = [NBRule new];
+                            r.host = d[@"host"] ?: @"*";
+                            r.port = [d[@"port"] intValue];
+                            NSString *p = [[d[@"proto"] description] lowercaseString];
+                            if ([p isEqualToString:@"tcp"]) r.proto = NBProtoTCP;
+                            else if ([p isEqualToString:@"udp"]) r.proto = NBProtoUDP;
+                            else r.proto = NBProtoAny;
+                            NSString *action = [[d[@"action"] description] lowercaseString];
+                            r.block = action.length ? [action isEqualToString:@"block"] : YES;
+                            [arr addObject:r];
+                        }
+                    }
                 }
             }
+            self->_rules = [arr copy];
+            self->_defaultBlock = defaultBlock;
+            self->_logEnabled = logEnabled;
+        } @catch (NSException *e) {
+            NSLog(@"[NetBlockTweak] reload exception: %@", e);
         }
-        self->_rules = arr;
-        self->_defaultBlock = defaultBlock;
-        self->_logEnabled = logEnabled;
     });
 }
 
@@ -129,8 +175,11 @@ static BOOL HostMatchesPattern(NSString *host, NSString *pattern) {
     if (!host || !pattern) return NO;
     if ([pattern isEqualToString:@"*"]) return YES;
     if ([pattern hasPrefix:@"*."]) {
-        NSString *suffix = [pattern substringFromIndex:1]; // 保留开头的 "."
-        return [host hasSuffix:suffix] || [host isEqualToString:[pattern substringFromIndex:2]];
+        // "*.example.com" → 匹配 "sub.example.com" 或 "example.com"
+        NSString *suffix = [pattern substringFromIndex:1]; // ".example.com"
+        if ([host hasSuffix:suffix]) return YES;
+        NSString *exact = [pattern substringFromIndex:2]; // "example.com"
+        return [host caseInsensitiveCompare:exact] == NSOrderedSame;
     }
     return [host caseInsensitiveCompare:pattern] == NSOrderedSame;
 }
@@ -139,7 +188,6 @@ static BOOL HostMatchesPattern(NSString *host, NSString *pattern) {
     __block BOOL result = _defaultBlock;
     if (!host) host = @"";
     dispatch_sync(_queue, ^{
-        // 规则按数组顺序匹配,命中第一条即返回,方便"先精确后通配"这类优先级配置
         for (NBRule *r in self->_rules) {
             BOOL hostMatch = HostMatchesPattern(host, r.host);
             BOOL portMatch = (r.port == 0) || (r.port == port);
@@ -154,15 +202,15 @@ static BOOL HostMatchesPattern(NSString *host, NSString *pattern) {
 }
 
 - (void)noteResolvedIP:(NSString *)ip forHost:(NSString *)host {
-    if (!ip || !host) return;
+    if (!ip.length || !host.length) return;
     dispatch_async(_queue, ^{
         self->_ipToHost[ip] = host;
     });
 }
 
 - (NSString *)hostForIP:(NSString *)ip {
+    if (!ip.length) return nil;
     __block NSString *h = nil;
-    if (!ip) return nil;
     dispatch_sync(_queue, ^{
         h = self->_ipToHost[ip];
     });
@@ -170,19 +218,33 @@ static BOOL HostMatchesPattern(NSString *host, NSString *pattern) {
 }
 
 - (void)logEvent:(NSString *)event {
-    if (!_logEnabled) return;
+    if (!_logEnabled || !event.length) return;
     NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], event];
     NSLog(@"[NetBlockTweak] %@", event);
+
     dispatch_async(_queue, ^{
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *path = LogFilePath();
-        if (![fm fileExistsAtPath:path]) {
-            [fm createFileAtPath:path contents:nil attributes:nil];
+        @try {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *path = LogFilePath();
+            NSString *dir = [path stringByDeletingLastPathComponent];
+            if (![fm fileExistsAtPath:dir]) {
+                [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+            }
+            if (![fm fileExistsAtPath:path]) {
+                [fm createFileAtPath:path contents:nil attributes:nil];
+            }
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+            if (!fh) return; // 无写权限时静默失败，避免崩溃
+            [fh seekToEndOfFile];
+            NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+            if (data) {
+                [fh writeData:data];
+            }
+            [fh closeFile];
+        } @catch (NSException *e) {
+            // 写日志失败绝不让进程崩
+            NSLog(@"[NetBlockTweak] logEvent failed: %@", e);
         }
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
     });
 }
 
@@ -195,10 +257,10 @@ static NSString *IPStringFromSockaddr(const struct sockaddr *addr) {
     char buf[INET6_ADDRSTRLEN] = {0};
     if (addr->sa_family == AF_INET) {
         struct sockaddr_in *in4 = (struct sockaddr_in *)addr;
-        inet_ntop(AF_INET, &in4->sin_addr, buf, sizeof(buf));
+        if (!inet_ntop(AF_INET, &in4->sin_addr, buf, sizeof(buf))) return nil;
     } else if (addr->sa_family == AF_INET6) {
         struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
-        inet_ntop(AF_INET6, &in6->sin6_addr, buf, sizeof(buf));
+        if (!inet_ntop(AF_INET6, &in6->sin6_addr, buf, sizeof(buf))) return nil;
     } else {
         return nil;
     }
@@ -217,7 +279,7 @@ static int PortFromSockaddr(const struct sockaddr *addr) {
 
 static BOOL ShouldBlockSockaddr(const struct sockaddr *addr, NBProto proto) {
     NSString *ip = IPStringFromSockaddr(addr);
-    if (!ip) return NO; // 非 IPv4/IPv6(如 unix domain socket)不处理
+    if (!ip) return NO; // 非 IPv4/IPv6 (如 unix domain socket) 不处理
     int port = PortFromSockaddr(addr);
     NSString *host = [[NBRuleEngine shared] hostForIP:ip] ?: ip;
     BOOL blocked = [[NBRuleEngine shared] shouldBlockHost:host port:port proto:proto];
@@ -235,11 +297,12 @@ static BOOL ShouldBlockSockaddr(const struct sockaddr *addr, NBProto proto) {
     if (address) {
         int type = 0;
         socklen_t len = sizeof(type);
-        getsockopt(socketFD, SOL_SOCKET, SO_TYPE, &type, &len);
-        NBProto proto = (type == SOCK_DGRAM) ? NBProtoUDP : NBProtoTCP;
-        if (ShouldBlockSockaddr(address, proto)) {
-            errno = ECONNREFUSED;
-            return -1;
+        if (getsockopt(socketFD, SOL_SOCKET, SO_TYPE, &type, &len) == 0) {
+            NBProto proto = (type == SOCK_DGRAM) ? NBProtoUDP : NBProtoTCP;
+            if (ShouldBlockSockaddr(address, proto)) {
+                errno = ECONNREFUSED;
+                return -1;
+            }
         }
     }
     return %orig;
@@ -257,28 +320,27 @@ static BOOL ShouldBlockSockaddr(const struct sockaddr *addr, NBProto proto) {
     int ret = %orig;
     if (ret == 0 && hostname && res && *res) {
         NSString *host = [NSString stringWithUTF8String:hostname];
-        for (struct addrinfo *p = *res; p != NULL; p = p->ai_next) {
-            NSString *ip = IPStringFromSockaddr(p->ai_addr);
-            if (ip) {
-                [[NBRuleEngine shared] noteResolvedIP:ip forHost:host];
+        if (host.length) {
+            for (struct addrinfo *p = *res; p != NULL; p = p->ai_next) {
+                NSString *ip = IPStringFromSockaddr(p->ai_addr);
+                if (ip.length) {
+                    [[NBRuleEngine shared] noteResolvedIP:ip forHost:host];
+                }
             }
         }
     }
     return ret;
 }
 
-#pragma mark - CFNetwork 层: 覆盖直接使用 CFStream/CFSocket/CFHost 的代码路径(域名信息在此处最完整,不必依赖 IP 反查)
+#pragma mark - CFNetwork 层: 覆盖直接使用 CFStream/CFSocket/CFHost 的代码路径
 
-// 老式/部分三方库会直接用域名建流,例如:
-// CFStreamCreatePairWithSocketToHost(kCFAllocatorDefault, (CFStringRef)host, port, &readStream, &writeStream);
 %hookf(void, CFStreamCreatePairWithSocketToHost, CFAllocatorRef alloc, CFStringRef host, UInt32 port, CFReadStreamRef *readStream, CFWriteStreamRef *writeStream) {
-    NSString *hostStr = (__bridge NSString *)host;
+    NSString *hostStr = host ? (__bridge NSString *)host : @"";
     BOOL blocked = [[NBRuleEngine shared] shouldBlockHost:hostStr port:(int)port proto:NBProtoTCP];
     [[NBRuleEngine shared] logEvent:
         [NSString stringWithFormat:@"[CFNETWORK%@] CFStreamCreatePairWithSocketToHost host=%@ port=%u",
             blocked ? @"-BLOCKED" : @"", hostStr, (unsigned)port]];
     if (blocked) {
-        // 直接给出两个 NULL 流,调用方按正常的"打开失败"逻辑处理即可
         if (readStream) *readStream = NULL;
         if (writeStream) *writeStream = NULL;
         return;
@@ -286,7 +348,6 @@ static BOOL ShouldBlockSockaddr(const struct sockaddr *addr, NBProto proto) {
     %orig;
 }
 
-// CFSocketStream 的另一常见入口: CFStreamCreatePairWithSocketToCFHost(alloc, CFHostRef, port, ...)
 %hookf(void, CFStreamCreatePairWithSocketToCFHost, CFAllocatorRef alloc, CFHostRef host, UInt32 port, CFReadStreamRef *readStream, CFWriteStreamRef *writeStream) {
     NSString *hostStr = nil;
     if (host) {
@@ -308,21 +369,22 @@ static BOOL ShouldBlockSockaddr(const struct sockaddr *addr, NBProto proto) {
     %orig;
 }
 
-// CFHost 域名解析,用于把域名缓存起来,补充 socket 层只拿得到 IP 的情况
 %hookf(Boolean, CFHostStartInfoResolution, CFHostRef theHost, CFHostInfoType info, CFStreamError *error) {
     Boolean ret = %orig;
-    if (ret && info == kCFHostAddresses) {
+    if (ret && info == kCFHostAddresses && theHost) {
         Boolean resolved = false;
         CFArrayRef names = CFHostGetNames(theHost, &resolved);
         NSString *hostStr = (names && CFArrayGetCount(names) > 0) ? (__bridge NSString *)CFArrayGetValueAtIndex(names, 0) : nil;
         Boolean addrResolved = false;
         CFArrayRef addrs = CFHostGetAddressing(theHost, &addrResolved);
-        if (hostStr && addrs) {
-            for (CFIndex i = 0; i < CFArrayGetCount(addrs); i++) {
+        if (hostStr.length && addrs) {
+            CFIndex count = CFArrayGetCount(addrs);
+            for (CFIndex i = 0; i < count; i++) {
                 CFDataRef addrData = (CFDataRef)CFArrayGetValueAtIndex(addrs, i);
+                if (!addrData) continue;
                 const struct sockaddr *sa = (const struct sockaddr *)CFDataGetBytePtr(addrData);
                 NSString *ip = IPStringFromSockaddr(sa);
-                if (ip) {
+                if (ip.length) {
                     [[NBRuleEngine shared] noteResolvedIP:ip forHost:hostStr];
                 }
             }
@@ -331,7 +393,7 @@ static BOOL ShouldBlockSockaddr(const struct sockaddr *addr, NBProto proto) {
     return ret;
 }
 
-#pragma mark - 高层: NSURLProtocol 拦截 HTTP/HTTPS(覆盖 NSURLSession / NSURLConnection / 大部分三方网络库)
+#pragma mark - 高层: NSURLProtocol 拦截 HTTP/HTTPS
 
 static NSString *const kNBHandledKey = @"com.yourteam.netblocktweak.handled";
 
@@ -362,7 +424,7 @@ static NSString *const kNBHandledKey = @"com.yourteam.netblocktweak.handled";
     BOOL blocked = [[NBRuleEngine shared] shouldBlockHost:host port:port proto:NBProtoTCP];
     [[NBRuleEngine shared] logEvent:
         [NSString stringWithFormat:@"[HTTP%@] %@ %@ (port %d) -> %@",
-            isHTTPS ? @"S" : @"", self.request.HTTPMethod, host, port, blocked ? @"BLOCKED" : @"ALLOWED"]];
+            isHTTPS ? @"S" : @"", self.request.HTTPMethod ?: @"?", host, port, blocked ? @"BLOCKED" : @"ALLOWED"]];
 
     if (blocked) {
         NSError *error = [NSError errorWithDomain:@"com.yourteam.netblocktweak"
@@ -416,15 +478,16 @@ willPerformHTTPRedirection:(NSHTTPURLResponse *)response
 @end
 
 // 部分 App 会给 NSURLSessionConfiguration 显式设置 protocolClasses,
-// 此时全局 registerClass: 不生效,这里额外 hook 一下把自定义 Protocol 插进去,提高覆盖率
+// 此时全局 registerClass: 不生效,这里额外 hook 一下把自定义 Protocol 插进去
 %hook NSURLSessionConfiguration
 
 - (NSArray *)protocolClasses {
     NSArray *orig = %orig;
-    if (!orig) return @[[NBURLProtocol class]];
-    if ([orig containsObject:[NBURLProtocol class]]) return orig;
+    Class cls = [NBURLProtocol class];
+    if (!orig) return @[cls];
+    if ([orig containsObject:cls]) return orig;
     NSMutableArray *arr = [orig mutableCopy];
-    [arr insertObject:[NBURLProtocol class] atIndex:0];
+    [arr insertObject:cls atIndex:0];
     return arr;
 }
 
@@ -434,9 +497,18 @@ willPerformHTTPRedirection:(NSHTTPURLResponse *)response
 
 %ctor {
     @autoreleasepool {
-        %init;
-        [NBRuleEngine shared];
-        [NSURLProtocol registerClass:[NBURLProtocol class]];
-        [[NBRuleEngine shared] logEvent:@"NetBlockTweak loaded"];
+        %init;  // 先完成所有 hook 注册
+
+        // 延迟一点初始化规则引擎，避免在 dyld 加载最早期就做文件 IO / GCD
+        // 用 dispatch_async 到主队列，确保进程基本就绪后再跑
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try {
+                [NBRuleEngine shared];
+                [NSURLProtocol registerClass:[NBURLProtocol class]];
+                [[NBRuleEngine shared] logEvent:@"NetBlockTweak loaded"];
+            } @catch (NSException *e) {
+                NSLog(@"[NetBlockTweak] ctor delayed init exception: %@", e);
+            }
+        });
     }
 }
