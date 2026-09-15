@@ -8,12 +8,49 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    env:
+      THEOS: /home/runner/theos
+      IOS_SDK_VERSION: "14.5"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Theos
-        uses: beerpiss/theos-action@v1
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot git perl build-essential rsync curl libtinfo5
+
+      - name: Clone Theos
+        run: git clone --recursive https://github.com/theos/theos.git "$THEOS"
+
+      - name: Cache toolchain + SDK
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.THEOS }}/toolchain/linux
+            ${{ env.THEOS }}/sdks
+          key: theos-toolchain-sdk-${{ env.IOS_SDK_VERSION }}-v1
+
+      - name: Download iOS toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o toolchain.tar.lzma \
+            https://github.com/sbingner/llvm-project/releases/latest/download/linux-ios-arm64e-clang-toolchain.tar.lzma
+          TMP=$(mktemp -d)
+          tar -xvf toolchain.tar.lzma -C "$TMP"
+          mkdir -p "$THEOS/toolchain/linux/iphone"
+          mv "$TMP"/ios-arm64e-clang-toolchain/* "$THEOS/toolchain/linux/iphone/"
+          rm -rf toolchain.tar.lzma "$TMP"
+
+      - name: Download iOS SDK
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$THEOS/sdks"
+          curl -L -o sdk.tar.xz \
+            "https://github.com/theos/sdks/releases/latest/download/iPhoneOS${IOS_SDK_VERSION}.sdk.tar.xz"
+          tar -xf sdk.tar.xz -C "$THEOS/sdks"
+          rm sdk.tar.xz
 
       - name: Build package
         run: make package FINALPACKAGE=1
