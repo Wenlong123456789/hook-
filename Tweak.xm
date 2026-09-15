@@ -1,23 +1,11 @@
-// NetBlockTweak - 安全版（先关掉所有底层 %hookf，只保留 NSURLProtocol）
-// 用途: 注入测试 App,按可配置规则拦截/放行 App 内的 HTTP/HTTPS 流量
-// 修复目标: 解决注入后秒闪退问题
-//
-// 变更说明:
-// 1. 暂时注释掉所有 %hookf (connect / sendto / getaddrinfo / CFStream* / CFHost*)
-// 2. 只保留 NSURLProtocol + NSURLSessionConfiguration 的 protocolClasses hook
-// 3. %ctor 更保守，延迟初始化
-// 4. 日志路径支持 rootless，写文件全加保护
-// 5. 规则引擎保持热加载
+// NetBlockTweak - 加强版（仅 NSURLProtocol，修复延迟崩溃 + 拦截失效）
+// 1. 立即注册 Protocol，不再延迟 0.5s
+// 2. 更安全的 NSURLProtocol 实现，减少几秒后崩溃
+// 3. 详细日志，方便确认是否真正命中请求
+// 4. 仍然不启用底层 %hookf（connect/getaddrinfo 等）
 
 #import <Foundation/Foundation.h>
 #import <CFNetwork/CFNetwork.h>
-// 以下头文件在关掉底层 hook 后其实不需要，保留不影响
-#import <sys/socket.h>
-#import <sys/types.h>
-#import <netinet/in.h>
-#import <arpa/inet.h>
-#import <netdb.h>
-#import <errno.h>
 
 #pragma mark - 类型定义
 
@@ -150,6 +138,8 @@ static NSString *LogFilePath(void) {
             self->_rules = [arr copy];
             self->_defaultBlock = defaultBlock;
             self->_logEnabled = logEnabled;
+            NSLog(@"[NetBlockTweak] rules reloaded, count=%lu, defaultBlock=%d, log=%d",
+                  (unsigned long)arr.count, defaultBlock, logEnabled);
         } @catch (NSException *e) {
             NSLog(@"[NetBlockTweak] reload exception: %@", e);
         }
@@ -214,21 +204,28 @@ static BOOL HostMatchesPattern(NSString *host, NSString *pattern) {
 
 @end
 
-#pragma mark - 高层: NSURLProtocol 拦截 HTTP/HTTPS（目前唯一启用的拦截层）
+#pragma mark - NSURLProtocol（加强稳定性）
 
 static NSString *const kNBHandledKey = @"com.yourteam.netblocktweak.handled";
 
 @interface NBURLProtocol : NSURLProtocol <NSURLSessionDataDelegate>
 @property (nonatomic, strong) NSURLSession *session;
 @property (nonatomic, strong) NSURLSessionDataTask *task;
+@property (nonatomic, assign) BOOL stopped;
 @end
 
 @implementation NBURLProtocol
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    if ([NSURLProtocol propertyForKey:kNBHandledKey inRequest:request]) return NO;
+    if ([NSURLProtocol propertyForKey:kNBHandledKey inRequest:request]) {
+        return NO;
+    }
     NSString *scheme = request.URL.scheme.lowercaseString;
-    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return NO;
+    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) {
+        return NO;
+    }
+    // 每次有请求进来都打日志，方便确认有没有真正走到 Protocol
+    NSLog(@"[NetBlockTweak] canInitWithRequest: %@", request.URL.absoluteString);
     return YES;
 }
 
@@ -236,7 +233,13 @@ static NSString *const kNBHandledKey = @"com.yourteam.netblocktweak.handled";
     return request;
 }
 
++ (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b {
+    return [super requestIsCacheEquivalent:a toRequest:b];
+}
+
 - (void)startLoading {
+    if (self.stopped) return;
+
     NSURL *url = self.request.URL;
     NSString *host = url.host ?: @"";
     BOOL isHTTPS = [url.scheme.lowercaseString isEqualToString:@"https"];
@@ -245,130 +248,159 @@ static NSString *const kNBHandledKey = @"com.yourteam.netblocktweak.handled";
     BOOL blocked = [[NBRuleEngine shared] shouldBlockHost:host port:port proto:NBProtoTCP];
     [[NBRuleEngine shared] logEvent:
         [NSString stringWithFormat:@"[HTTP%@] %@ %@ (port %d) -> %@",
-            isHTTPS ? @"S" : @"", self.request.HTTPMethod ?: @"?", host, port,
+            isHTTPS ? @"S" : @"",
+            self.request.HTTPMethod ?: @"?",
+            host,
+            port,
             blocked ? @"BLOCKED" : @"ALLOWED"]];
 
     if (blocked) {
-        NSError *error = [NSError errorWithDomain:@"com.yourteam.netblocktweak"
-                                              code:-1009
-                                          userInfo:@{NSLocalizedDescriptionKey: @"Blocked by NetBlockTweak test rule"}];
-        [self.client URLProtocol:self didFailWithError:error];
+        // 用网络错误码模拟断网，很多 App 能正常降级
+        NSError *error = [NSError errorWithDomain:NSURLErrorDomain
+                                              code:NSURLErrorNotConnectedToInternet
+                                          userInfo:@{
+                                              NSLocalizedDescriptionKey: @"Blocked by NetBlockTweak",
+                                              NSURLErrorFailingURLErrorKey: url ?: [NSURL URLWithString:@""]
+                                          }];
+        // 回调尽量切回主线程，降低崩溃概率
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!self.stopped) {
+                [self.client URLProtocol:self didFailWithError:error];
+            }
+        });
         return;
     }
 
-    NSMutableURLRequest *forwardedRequest = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:kNBHandledKey inRequest:forwardedRequest];
+    // 放行：用独立 session 转发，并打上 handled 标记防止循环
+    NSMutableURLRequest *forwarded = [self.request mutableCopy];
+    if (!forwarded) {
+        NSError *err = [NSError errorWithDomain:@"com.yourteam.netblocktweak" code:-1
+                                       userInfo:@{NSLocalizedDescriptionKey: @"mutableCopy failed"}];
+        [self.client URLProtocol:self didFailWithError:err];
+        return;
+    }
+    [NSURLProtocol setProperty:@YES forKey:kNBHandledKey inRequest:forwarded];
 
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    self.session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
-    self.task = [self.session dataTaskWithRequest:forwardedRequest];
+    // 用 default 而不是 ephemeral，兼容性更好；禁止协议类再走我们自己，避免循环
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    config.protocolClasses = @[];   // 关键，不再经过任何自定义 Protocol
+    config.timeoutIntervalForRequest = 30;
+    config.timeoutIntervalForResource = 60;
+
+    self.session = [NSURLSession sessionWithConfiguration:config
+                                                 delegate:self
+                                            delegateQueue:nil];
+    self.task = [self.session dataTaskWithRequest:forwarded];
     [self.task resume];
 }
 
 - (void)stopLoading {
+    self.stopped = YES;
     [self.task cancel];
+    self.task = nil;
     [self.session invalidateAndCancel];
+    self.session = nil;
 }
 
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)task
-    didReceiveResponse:(NSURLResponse *)response
-     completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler {
-    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+#pragma mark - NSURLSessionDataDelegate
+
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)task
+didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    if (self.stopped) {
+        completionHandler(NSURLSessionResponseCancel);
+        return;
+    }
+    // 回调到主线程更安全
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.stopped) {
+            [self.client URLProtocol:self
+                  didReceiveResponse:response
+                  cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        }
+    });
     completionHandler(NSURLSessionResponseAllow);
 }
 
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)task didReceiveData:(NSData *)data {
-    [self.client URLProtocol:self didLoadData:data];
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)task
+    didReceiveData:(NSData *)data {
+    if (self.stopped || !data) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.stopped) {
+            [self.client URLProtocol:self didLoadData:data];
+        }
+    });
 }
 
-- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
-    if (error) {
-        [self.client URLProtocol:self didFailWithError:error];
-    } else {
-        [self.client URLProtocolDidFinishLoading:self];
-    }
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+didCompleteWithError:(NSError *)error {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.stopped) return;
+        if (error) {
+            [self.client URLProtocol:self didFailWithError:error];
+        } else {
+            [self.client URLProtocolDidFinishLoading:self];
+        }
+    });
 }
 
 - (void)URLSession:(NSURLSession *)session
               task:(NSURLSessionTask *)task
 willPerformHTTPRedirection:(NSHTTPURLResponse *)response
         newRequest:(NSURLRequest *)request
- completionHandler:(void (^)(NSURLRequest *))completionHandler {
+ completionHandler:(void (^)(NSURLRequest * _Nullable))completionHandler {
+    // 重定向继续走原请求，由上层再决定是否拦截
     completionHandler(request);
 }
 
 @end
+
+#pragma mark - 强制把 Protocol 插进所有 Configuration
 
 %hook NSURLSessionConfiguration
 
 - (NSArray *)protocolClasses {
     NSArray *orig = %orig;
     Class cls = [NBURLProtocol class];
+    if (!cls) return orig;
     if (!orig) return @[cls];
     if ([orig containsObject:cls]) return orig;
     NSMutableArray *arr = [orig mutableCopy];
     [arr insertObject:cls atIndex:0];
-    return arr;
+    return [arr copy];
+}
+
+// 有些 App 会 setProtocolClasses:，这里也插进去
+- (void)setProtocolClasses:(NSArray *)protocolClasses {
+    Class cls = [NBURLProtocol class];
+    if (cls && protocolClasses && ![protocolClasses containsObject:cls]) {
+        NSMutableArray *arr = [protocolClasses mutableCopy];
+        [arr insertObject:cls atIndex:0];
+        %orig(arr);
+        return;
+    }
+    %orig;
 }
 
 %end
 
-#pragma mark - 初始化（安全版）
+#pragma mark - 初始化
 
 %ctor {
     @autoreleasepool {
-        %init;   // 只初始化上面的 NSURLSessionConfiguration hook
+        %init;
 
-        // 延迟到主队列，尽量避开启动最早期
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            @try {
-                [NBRuleEngine shared];
-                [NSURLProtocol registerClass:[NBURLProtocol class]];
-                [[NBRuleEngine shared] logEvent:@"NetBlockTweak (safe mode) loaded - only NSURLProtocol active"];
-            } @catch (NSException *e) {
-                NSLog(@"[NetBlockTweak] delayed init exception: %@", e);
-            }
-        });
+        // 立刻初始化，不再延迟，避免启动早期请求漏拦
+        @try {
+            [NBRuleEngine shared];
+            BOOL ok = [NSURLProtocol registerClass:[NBURLProtocol class]];
+            NSLog(@"[NetBlockTweak] registerClass result = %d", ok);
+            [[NBRuleEngine shared] logEvent:@"NetBlockTweak loaded (NSURLProtocol only)"];
+        } @catch (NSException *e) {
+            NSLog(@"[NetBlockTweak] ctor exception: %@", e);
+        }
     }
 }
-
-/*
- ============================================================
- 以下是原来的底层 hook，全部暂时注释掉。
- 等「安全版」能正常打开 App 后，再逐步取消注释测试。
- ============================================================
-
-#pragma mark - 低层 socket（暂时禁用）
-
-%hookf(int, connect, int socketFD, const struct sockaddr *address, socklen_t address_len) {
-    // ... 原逻辑
-    return %orig;
-}
-
-%hookf(ssize_t, sendto, int socketFD, const void *buffer, size_t length, int flags, const struct sockaddr *dest_addr, socklen_t dest_len) {
-    // ...
-    return %orig;
-}
-
-%hookf(int, getaddrinfo, const char *hostname, const char *servname, const struct addrinfo *hints, struct addrinfo **res) {
-    // ...
-    return %orig;
-}
-
-#pragma mark - CFNetwork（暂时禁用）
-
-%hookf(void, CFStreamCreatePairWithSocketToHost, CFAllocatorRef alloc, CFStringRef host, UInt32 port, CFReadStreamRef *readStream, CFWriteStreamRef *writeStream) {
-    // ...
-    %orig;
-}
-
-%hookf(void, CFStreamCreatePairWithSocketToCFHost, CFAllocatorRef alloc, CFHostRef host, UInt32 port, CFReadStreamRef *readStream, CFWriteStreamRef *writeStream) {
-    // ...
-    %orig;
-}
-
-%hookf(Boolean, CFHostStartInfoResolution, CFHostRef theHost, CFHostInfoType info, CFStreamError *error) {
-    // ...
-    return %orig;
-}
-*/
